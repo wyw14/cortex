@@ -440,6 +440,62 @@ query_scheduler:
     # CLI flag: -query-scheduler.grpc-client-config.connect-timeout
     [connect_timeout: <duration> | default = 5s]
 
+  # The query_admission_lease configures the optional, instance-local query
+  # admission lease. It bounds the number of in-flight query fragment tasks and
+  # reserves weighted quota against all authorized tenants of a request. It is
+  # in-memory accounting scoped to a single query-scheduler process, not a
+  # distributed or persistent global quota. When disabled, the query-scheduler
+  # behaves as before.
+  query_admission_lease:
+    # Enable the query admission lease in the query-scheduler.
+    # CLI flag: -query-scheduler.query-admission-lease.enabled
+    [enabled: <boolean> | default = false]
+
+    # Maximum number of query fragment tasks that may be admitted (in-flight)
+    # at the same time across the whole query-scheduler instance.
+    # CLI flag: -query-scheduler.query-admission-lease.max-inflight-tasks
+    [max_inflight_tasks: <int> | default = 1000]
+
+    # Maximum number of fragment tasks that a single root query (including all
+    # of its fragments and retries) may have admitted at the same time.
+    # CLI flag: -query-scheduler.query-admission-lease.max-tasks-per-root-query
+    [max_tasks_per_root_query: <int> | default = 100]
+
+    # Default weighted in-flight quota charged against each authorized tenant.
+    # Per-tenant overrides can be set in the YAML configuration.
+    # CLI flag: -query-scheduler.query-admission-lease.default-tenant-max-inflight-tasks
+    [default_tenant_max_inflight_tasks: <float64> | default = 100]
+
+    # Per-tenant override of the weighted in-flight quota. YAML-only; tenants
+    # without an entry use default_tenant_max_inflight_tasks.
+    [tenant_max_inflight_tasks: <map of string to float64> | default = {}]
+
+    # Default quota weight charged per admitted task against each authorized
+    # tenant. Federated requests reserve the weighted quota against every
+    # authorized tenant at once.
+    # CLI flag: -query-scheduler.query-admission-lease.default-tenant-task-weight
+    [default_tenant_task_weight: <float64> | default = 1]
+
+    # Per-tenant override of the per-task weight. YAML-only; tenants without an
+    # entry use default_tenant_task_weight.
+    [tenant_task_weight: <map of string to float64> | default = {}]
+
+    # Conservative time-to-live for task grants and root leases. Task grants
+    # that are not explicitly released before the TTL expires are
+    # force-reclaimed, so a lost querier cannot leak credits forever.
+    # CLI flag: -query-scheduler.query-admission-lease.lease-ttl
+    [lease_ttl: <duration> | default = 5m0s]
+
+    # Maximum time an enqueue waits for enough admission credits before
+    # failing. Waiting does not block other enqueues or cancellations.
+    # CLI flag: -query-scheduler.query-admission-lease.enqueue-wait-timeout
+    [enqueue_wait_timeout: <duration> | default = 30s]
+
+    # How often the query-scheduler scans for task grants and root leases that
+    # exceeded their lease TTL.
+    # CLI flag: -query-scheduler.query-admission-lease.reap-interval
+    [reap_interval: <duration> | default = 30s]
+
 # The tracing_config configures backends cortex uses.
 [tracing: <tracing_config>]
 ```

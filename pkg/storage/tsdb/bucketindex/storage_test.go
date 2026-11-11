@@ -143,6 +143,81 @@ func BenchmarkReadIndex(b *testing.B) {
 	}
 }
 
+func TestReadIndexArtifact_ShouldReturnDigestAndParsedIndexFromSingleObject(t *testing.T) {
+	const userID = "user-1"
+
+	ctx := context.Background()
+	logger := log.NewNopLogger()
+
+	bkt, _ := testutil.PrepareFilesystemBucket(t)
+	bkt = BucketWithGlobalMarkers(bkt)
+	testutil.MockStorageBlock(t, bkt, userID, 10, 20)
+	testutil.MockStorageBlock(t, bkt, userID, 20, 30)
+
+	u := NewUpdater(bkt, userID, nil, logger)
+	expectedIdx, _, _, err := u.UpdateIndex(ctx, nil)
+	require.NoError(t, err)
+	require.NoError(t, WriteIndex(ctx, bkt, userID, nil, expectedIdx))
+
+	actualIdx, digest, err := ReadIndexArtifact(ctx, bkt, userID, nil, logger)
+	require.NoError(t, err)
+	require.Len(t, digest, 64) // SHA-256 hex encoded.
+	assert.Equal(t, expectedIdx, actualIdx)
+
+	// Reading the same immutable object must produce a stable digest.
+	_, digestAgain, err := ReadIndexArtifact(ctx, bkt, userID, nil, logger)
+	require.NoError(t, err)
+	assert.Equal(t, digest, digestAgain)
+
+	// Rewriting the index with another block must change the digest.
+	testutil.MockStorageBlock(t, bkt, userID, 30, 40)
+	updatedIdx, _, _, err := u.UpdateIndex(ctx, nil)
+	require.NoError(t, err)
+	require.NoError(t, WriteIndex(ctx, bkt, userID, nil, updatedIdx))
+	_, newDigest, err := ReadIndexArtifact(ctx, bkt, userID, nil, logger)
+	require.NoError(t, err)
+	assert.NotEqual(t, digest, newDigest)
+}
+
+func TestReadIndexArtifact_ShouldMapMissingAndCorruptedLikeReadIndex(t *testing.T) {
+	const userID = "user-1"
+
+	ctx := context.Background()
+	logger := log.NewNopLogger()
+
+	t.Run("missing", func(t *testing.T) {
+		bkt, _ := testutil.PrepareFilesystemBucket(t)
+		idx, digest, err := ReadIndexArtifact(ctx, bkt, userID, nil, logger)
+		require.Equal(t, ErrIndexNotFound, err)
+		require.Nil(t, idx)
+		require.Empty(t, digest)
+	})
+
+	t.Run("corrupted", func(t *testing.T) {
+		bkt, _ := testutil.PrepareFilesystemBucket(t)
+		require.NoError(t, bkt.Upload(ctx, path.Join(userID, IndexCompressedFilename), strings.NewReader("invalid!}")))
+
+		idx, digest, err := ReadIndexArtifact(ctx, bkt, userID, nil, logger)
+		require.Equal(t, ErrIndexCorrupted, err)
+		require.Nil(t, idx)
+		// The corrupted object is still bound to its exact bytes via the digest.
+		require.Len(t, digest, 64)
+	})
+
+	t.Run("access denied", func(t *testing.T) {
+		bkt, _ := testutil.PrepareFilesystemBucket(t)
+		bkt = &testutil.MockBucketFailure{
+			Bucket: bkt,
+			GetFailures: map[string]error{
+				path.Join(userID, IndexCompressedFilename): testutil.ErrKeyAccessDeniedError,
+			},
+		}
+		idx, _, err := ReadIndexArtifact(ctx, bkt, userID, nil, logger)
+		require.True(t, errors.Is(err, bucket.ErrCustomerManagedKeyAccessDenied))
+		require.Nil(t, idx)
+	})
+}
+
 func TestDeleteIndex_ShouldNotReturnErrorIfIndexDoesNotExist(t *testing.T) {
 	ctx := context.Background()
 	bkt, _ := testutil.PrepareFilesystemBucket(t)

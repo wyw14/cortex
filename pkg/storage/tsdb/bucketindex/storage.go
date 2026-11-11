@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"time"
@@ -98,6 +100,58 @@ func ReadIndex(ctx context.Context, bkt objstore.Bucket, userID string, cfgProvi
 	}
 
 	return index, nil
+}
+
+// ReadIndexArtifact reads the bucket index in a single Get so that callers get an immutable,
+// point-in-time view of one specific index object. It returns the parsed index together with
+// the SHA-256 digest (hex encoded) of the raw (gzipped) object bytes. The digest is meant to
+// be referenced by artifacts (eg. coverage reports) built from the returned index so that the
+// artifact can be proven to refer to this exact index object.
+//
+// The returned index is NOT a cross-object atomic snapshot of the bucket: weakly consistent
+// object stores do not provide any guarantee that the index content is in sync with the other
+// objects it references.
+func ReadIndexArtifact(ctx context.Context, bkt objstore.Bucket, userID string, cfgProvider bucket.TenantConfigProvider, logger log.Logger) (*Index, string, error) {
+	userBkt := bucket.NewUserBucketClient(userID, bkt, cfgProvider)
+
+	// Get the bucket index. A single Get is used to make sure the digest and the parsed index
+	// refer to the same object bytes.
+	reader, err := userBkt.WithExpectedErrs(bucket.IsOneOfTheExpectedErrors(userBkt.IsAccessDeniedErr, userBkt.IsObjNotFoundErr)).Get(ctx, IndexCompressedFilename)
+	if err != nil {
+		if userBkt.IsObjNotFoundErr(err) {
+			return nil, "", ErrIndexNotFound
+		}
+
+		if userBkt.IsAccessDeniedErr(err) {
+			return nil, "", cortex_errors.WithCause(bucket.ErrCustomerManagedKeyAccessDenied, err)
+		}
+
+		return nil, "", errors.Wrap(err, "read bucket index")
+	}
+	defer runutil.CloseWithLogOnErr(logger, reader, "close bucket index reader")
+
+	// Read all the content once and compute the digest over the raw bytes.
+	rawContent, err := io.ReadAll(reader)
+	if err != nil {
+		return nil, "", errors.Wrap(err, "read bucket index content")
+	}
+	digest := sha256.Sum256(rawContent)
+
+	gzipReader, err := gzip.NewReader(bytes.NewReader(rawContent))
+	if err != nil {
+		// The digest is still returned so that the caller can bind an Unknown artifact to the
+		// exact corrupted object bytes.
+		return nil, hex.EncodeToString(digest[:]), ErrIndexCorrupted
+	}
+	defer runutil.CloseWithLogOnErr(logger, gzipReader, "close bucket index gzip reader")
+
+	// Deserialize it.
+	index := &Index{}
+	if err := json.NewDecoder(gzipReader).Decode(index); err != nil {
+		return nil, hex.EncodeToString(digest[:]), ErrIndexCorrupted
+	}
+
+	return index, hex.EncodeToString(digest[:]), nil
 }
 
 // WriteIndex uploads the provided index to the storage.

@@ -1405,7 +1405,7 @@ func TestResultsCacheMaxFreshness(t *testing.T) {
 			// fill cache
 			key := splitter(day).GenerateCacheKey(ctx, "1", req)
 			tenantIDs, _ := users.TenantIDs(ctx)
-			rc.(*resultsCache).put(ctx, key, []tripperware.Extent{mkExtent(int64(modelNow)-(600*1e3), int64(modelNow))}, tenantIDs)
+			rc.(*resultsCache).put(ctx, key, []tripperware.Extent{mkExtent(int64(modelNow)-(600*1e3), int64(modelNow))}, tenantIDs, nil)
 
 			resp, err := rc.Do(ctx, req)
 			require.NoError(t, err)
@@ -1442,23 +1442,23 @@ func Test_resultsCache_MissingData(t *testing.T) {
 		Start:    100,
 		End:      200,
 		Response: nil,
-	}}, tenantIDs)
-	rc.put(ctx, "notempty", []tripperware.Extent{mkExtent(100, 120)}, tenantIDs)
+	}}, tenantIDs, nil)
+	rc.put(ctx, "notempty", []tripperware.Extent{mkExtent(100, 120)}, tenantIDs, nil)
 	rc.put(ctx, "mixed", []tripperware.Extent{mkExtent(100, 120), {
 		Start:    120,
 		End:      200,
 		Response: nil,
-	}}, tenantIDs)
+	}}, tenantIDs, nil)
 
-	extents, hit := rc.get(ctx, "empty", 0)
+	extents, hit := rc.get(ctx, "empty", 0, nil)
 	require.Empty(t, extents)
 	require.False(t, hit)
 
-	extents, hit = rc.get(ctx, "notempty", 0)
+	extents, hit = rc.get(ctx, "notempty", 0, nil)
 	require.Equal(t, len(extents), 1)
 	require.True(t, hit)
 
-	extents, hit = rc.get(ctx, "mixed", 0)
+	extents, hit = rc.get(ctx, "mixed", 0, nil)
 	require.Equal(t, len(extents), 0)
 	require.False(t, hit)
 }
@@ -2006,7 +2006,7 @@ func TestResultsCachePutTTLSelection(t *testing.T) {
 			rc.now = func() time.Time { return now }
 
 			ctx := user.InjectOrgID(context.Background(), strings.Join(tc.tenantIDs, "|"))
-			rc.put(ctx, "test-key", tc.extents, tc.tenantIDs)
+			rc.put(ctx, "test-key", tc.extents, tc.tenantIDs, nil)
 
 			assert.Equal(t, tc.expectedTTL, mockCache.(*cache.MockCache).GetLastTTL())
 		})

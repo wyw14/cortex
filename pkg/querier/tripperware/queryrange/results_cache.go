@@ -47,9 +47,10 @@ var (
 
 // ResultsCacheConfig is the config for the results cache.
 type ResultsCacheConfig struct {
-	CacheConfig                cache.Config `yaml:"cache"`
-	Compression                string       `yaml:"compression"`
-	CacheQueryableSamplesStats bool         `yaml:"cache_queryable_samples_stats"`
+	CacheConfig                cache.Config                `yaml:"cache"`
+	Compression                string                      `yaml:"compression"`
+	CacheQueryableSamplesStats bool                        `yaml:"cache_queryable_samples_stats"`
+	AuthenticatedEnvelope      AuthenticatedEnvelopeConfig `yaml:"authenticated_envelope"`
 }
 
 // RegisterFlags registers flags.
@@ -58,6 +59,7 @@ func (cfg *ResultsCacheConfig) RegisterFlags(f *flag.FlagSet) {
 
 	f.StringVar(&cfg.Compression, "frontend.compression", "", "Use compression in results cache. Supported values are: 'snappy' and '' (disable compression).")
 	f.BoolVar(&cfg.CacheQueryableSamplesStats, "frontend.cache-queryable-samples-stats", false, "Cache Statistics queryable samples on results cache.")
+	cfg.AuthenticatedEnvelope.RegisterFlags(f)
 	//lint:ignore faillint Need to pass the global logger like this for warning on deprecated methods
 	flagext.DeprecatedFlag(f, "frontend.cache-split-interval", "Deprecated: The maximum interval expected for each request, results will be cached per single interval. This behavior is now determined by querier.split-queries-by-interval.", util_log.Logger)
 }
@@ -72,6 +74,10 @@ func (cfg *ResultsCacheConfig) Validate(qCfg querier.Config) error {
 
 	if cfg.CacheQueryableSamplesStats && !qCfg.EnablePerStepStats {
 		return errors.New("frontend.cache-queryable-samples-stats may only be enabled in conjunction with querier.per-step-stats-enabled. Please set the latter")
+	}
+
+	if err := cfg.AuthenticatedEnvelope.Validate(); err != nil {
+		return err
 	}
 
 	return cfg.CacheConfig.Validate()
@@ -150,16 +156,30 @@ type CacheSplitter interface {
 // splitter is a utility for using split interval when determining cache keys
 type splitter time.Duration
 
+// gridIntervalProvider is optionally implemented by cache key splitters that
+// can expose the resolved split (grid) interval so it can be bound into the
+// authenticated envelope independently of the cache key string.
+type gridIntervalProvider interface {
+	GridInterval(ctx context.Context) time.Duration
+}
+
 // GenerateCacheKey generates a cache key based on the userID, Request and interval.
 func (t splitter) GenerateCacheKey(ctx context.Context, userID string, r tripperware.Request) string {
+	interval := t.GridInterval(ctx)
+
+	currentInterval := r.GetStart() / int64(interval/time.Millisecond)
+	return fmt.Sprintf("%s:%s:%d:%d", userID, r.GetQuery(), r.GetStep(), currentInterval)
+}
+
+// GridInterval returns the split interval used to place the request on the
+// cache time grid, honoring a per-query dynamic split interval override.
+func (t splitter) GridInterval(ctx context.Context) time.Duration {
 	stats := querier_stats.FromContext(ctx)
 	interval := stats.LoadSplitInterval()
 	if interval == 0 {
 		interval = time.Duration(t)
 	}
-
-	currentInterval := r.GetStart() / int64(interval/time.Millisecond)
-	return fmt.Sprintf("%s:%s:%d:%d", userID, r.GetQuery(), r.GetStep(), currentInterval)
+	return interval
 }
 
 // ShouldCacheFn checks whether the current request should go to cache
@@ -181,6 +201,9 @@ type resultsCache struct {
 	shouldCache                ShouldCacheFn
 	cacheQueryableSamplesStats bool
 	tenantResolverFn           func() users.Resolver
+	// envelope is nil when the authenticated envelope is disabled, in which
+	// case cache entries keep their legacy plain protobuf format.
+	envelope *authenticatedEnvelope
 }
 
 // NewResultsCacheMiddleware creates results cache middleware from config.
@@ -204,7 +227,18 @@ func NewResultsCacheMiddleware(
 	if err != nil {
 		return nil, nil, err
 	}
-	if cfg.Compression == "snappy" {
+
+	var envelope *authenticatedEnvelope
+	if cfg.AuthenticatedEnvelope.Enabled {
+		// The envelope owns compression internally so that reads can verify
+		// the HMAC before decompressing. The snappy wrapper must not be added
+		// on top of the envelope, otherwise untrusted bytes would be decoded
+		// before authentication.
+		envelope, err = newAuthenticatedEnvelope(cfg.AuthenticatedEnvelope, cfg.Compression, logger, reg)
+		if err != nil {
+			return nil, nil, err
+		}
+	} else if cfg.Compression == "snappy" {
 		c = cache.NewSnappy(c, logger)
 	}
 
@@ -223,6 +257,7 @@ func NewResultsCacheMiddleware(
 			shouldCache:                shouldCache,
 			cacheQueryableSamplesStats: cfg.CacheQueryableSamplesStats,
 			tenantResolverFn:           tenantResolverFn,
+			envelope:                   envelope,
 		}
 	}), c, nil
 }
@@ -262,6 +297,29 @@ func (s resultsCache) Do(ctx context.Context, r tripperware.Request) (tripperwar
 
 	key := s.splitter.GenerateCacheKey(ctx, cacheUserID, r)
 
+	// Build the authenticated semantic identity from the trusted request and
+	// tenant context. It is deliberately independent of the cache key string,
+	// which remains a retrieval handle only.
+	var authIdentity *cacheAuthIdentity
+	if s.envelope != nil {
+		var gridIntervalMillis int64
+		if grid, ok := s.splitter.(gridIntervalProvider); ok {
+			gridIntervalMillis = grid.GridInterval(ctx).Milliseconds()
+		}
+		var gridBucket int64
+		if gridIntervalMillis > 0 {
+			gridBucket = r.GetStart() / gridIntervalMillis
+		}
+		authIdentity = &cacheAuthIdentity{
+			tenantIDs:          append([]string(nil), tenantIDs...),
+			query:              r.GetQuery(),
+			stepMillis:         r.GetStep(),
+			gridIntervalMillis: gridIntervalMillis,
+			gridBucket:         gridBucket,
+			protocolVersion:    queryRangeCacheProtocolVersion,
+		}
+	}
+
 	var (
 		extents  []tripperware.Extent
 		response tripperware.Response
@@ -275,7 +333,7 @@ func (s resultsCache) Do(ctx context.Context, r tripperware.Request) (tripperwar
 	}
 
 	ttl := s.getTTLForExtents(tenantIDs, []tripperware.Extent{{Start: r.GetStart(), End: r.GetEnd()}})
-	cached, ok := s.get(ctx, key, ttl)
+	cached, ok := s.get(ctx, key, ttl, authIdentity)
 	if ok {
 		response, extents, err = s.handleHit(ctx, r, cached, maxCacheTime)
 	} else {
@@ -302,7 +360,7 @@ func (s resultsCache) Do(ctx context.Context, r tripperware.Request) (tripperwar
 			}
 			extents[i].Response = any
 		}
-		s.put(ctx, key, extents, tenantIDs)
+		s.put(ctx, key, extents, tenantIDs, authIdentity)
 	}
 
 	if err == nil && !respWithStats {
@@ -747,19 +805,30 @@ func (s resultsCache) filterRecentExtents(req tripperware.Request, maxCacheFresh
 	return extents, nil
 }
 
-func (s resultsCache) get(ctx context.Context, key string, ttl time.Duration) ([]tripperware.Extent, bool) {
+func (s resultsCache) get(ctx context.Context, key string, ttl time.Duration, authIdentity *cacheAuthIdentity) ([]tripperware.Extent, bool) {
 	found, bufs, _ := s.cache.Fetch(ctx, []string{cache.HashKey(key)}, ttl)
 	if len(found) != 1 {
 		return nil, false
+	}
+
+	raw := bufs[0]
+	if s.envelope != nil {
+		// Length limiting and HMAC verification happen before any
+		// decompression or protobuf decoding; every failure is a cache miss.
+		payload, _, err := s.envelope.open(ctx, authIdentity, raw)
+		if err != nil {
+			return nil, false
+		}
+		raw = payload
 	}
 
 	var resp tripperware.CachedResponse
 	log, ctx := spanlogger.New(ctx, "unmarshal-extent") //nolint:ineffassign,staticcheck
 	defer log.Finish()
 
-	log.LogFields(otlog.Int("bytes", len(bufs[0])))
+	log.LogFields(otlog.Int("bytes", len(raw)))
 
-	if err := proto.Unmarshal(bufs[0], &resp); err != nil {
+	if err := proto.Unmarshal(raw, &resp); err != nil {
 		level.Error(log).Log("msg", "error unmarshalling cached value", "err", err)
 		log.Error(err)
 		return nil, false
@@ -827,7 +896,7 @@ func (s resultsCache) extentsOverlapOutOfOrderWindow(extents []tripperware.Exten
 
 	return false
 }
-func (s resultsCache) put(ctx context.Context, key string, extents []tripperware.Extent, tenantIDs []string) {
+func (s resultsCache) put(ctx context.Context, key string, extents []tripperware.Extent, tenantIDs []string, authIdentity *cacheAuthIdentity) {
 	ttl := s.getTTLForExtents(tenantIDs, extents)
 	buf, err := proto.Marshal(&tripperware.CachedResponse{
 		Key:     key,
@@ -836,6 +905,21 @@ func (s resultsCache) put(ctx context.Context, key string, extents []tripperware
 	if err != nil {
 		level.Error(util_log.WithContext(ctx, s.logger)).Log("msg", "error marshalling cached value", "err", err)
 		return
+	}
+
+	if s.envelope != nil {
+		// The trusted server policy may only shorten the backend TTL. The
+		// effective TTL is authenticated inside the envelope header.
+		ttl = s.envelope.truncateTTL(ttl)
+		sealed, sealErr := s.envelope.seal(ctx, authIdentity, buf, ttl)
+		if sealErr != nil {
+			// Caching is best effort: a write failure must not fail the source
+			// query, whose response has already been produced. The payload is
+			// never logged.
+			level.Error(util_log.WithContext(ctx, s.logger)).Log("msg", "failed to seal authenticated results cache entry", "err", sealErr)
+			return
+		}
+		buf = sealed
 	}
 
 	s.cache.Store(ctx, []string{cache.HashKey(key)}, [][]byte{buf}, ttl)

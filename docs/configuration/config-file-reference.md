@@ -5802,6 +5802,59 @@ results_cache:
   # CLI flag: -frontend.cache-queryable-samples-stats
   [cache_queryable_samples_stats: <boolean> | default = false]
 
+  authenticated_envelope:
+    # Enable the HMAC authenticated envelope for query-range results cache
+    # entries. When enabled, cache keys remain retrieval handles only and every
+    # entry is authenticated before it is decompressed or decoded. Disabled by
+    # default and the legacy cache format is preserved.
+    # CLI flag: -frontend.results-cache-authenticated-envelope.enabled
+    [enabled: <boolean> | default = false]
+
+    # Key ID of the active HMAC signing key for the authenticated results cache
+    # envelope. Keys are configured inline only and never loaded from paths or
+    # URLs.
+    # CLI flag: -frontend.results-cache-authenticated-envelope.signing-key-id
+    [signing_key_id: <string> | default = ""]
+
+    # Active HMAC-SHA256 signing secret for the authenticated results cache
+    # envelope (minimum 32 bytes).
+    # CLI flag: -frontend.results-cache-authenticated-envelope.signing-key
+    [signing_key: <string> | default = ""]
+
+    # Comma-separated key IDs of retired HMAC keys still accepted when verifying
+    # old authenticated results cache entries. Positions must match
+    # -frontend.results-cache-authenticated-envelope.verify-keys.
+    # CLI flag: -frontend.results-cache-authenticated-envelope.verify-key-ids
+    [verify_key_ids: <list of string> | default = []]
+
+    # Comma-separated retired HMAC signing secrets still accepted when verifying
+    # old authenticated results cache entries. Positions must match
+    # -frontend.results-cache-authenticated-envelope.verify-key-ids.
+    # CLI flag: -frontend.results-cache-authenticated-envelope.verify-keys
+    [verify_keys: <string> | default = ""]
+
+    # Maximum size in bytes of a raw authenticated results cache entry accepted
+    # on reads. Enforced before parsing or decompression.
+    # CLI flag: -frontend.results-cache-authenticated-envelope.max-cache-entry-bytes
+    [max_cache_entry_bytes: <int> | default = 67108864]
+
+    # Maximum size in bytes of the decompressed authenticated results cache
+    # payload. Entries declaring a larger payload are rejected as cache misses
+    # before decoding.
+    # CLI flag: -frontend.results-cache-authenticated-envelope.max-decoded-payload-bytes
+    [max_decoded_payload_bytes: <int> | default = 134217728]
+
+    # Server-trusted invalidation generation for authenticated results cache
+    # entries. Bumping this value invalidates all entries signed under a
+    # previous generation, even if their signature is still valid.
+    # CLI flag: -frontend.results-cache-authenticated-envelope.invalidation-generation
+    [invalidation_generation: <int> | default = 0]
+
+    # When non-zero, the TTL of authenticated results cache entries is truncated
+    # to this value. Zero keeps the existing server-side per-tenant TTL policy.
+    # CLI flag: -frontend.results-cache-authenticated-envelope.max-ttl
+    [max_ttl: <duration> | default = 0s]
+
 # Cache query results.
 # CLI flag: -querier.cache-results
 [cache_results: <boolean> | default = false]

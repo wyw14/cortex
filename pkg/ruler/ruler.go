@@ -182,6 +182,10 @@ type Config struct {
 	AllowedFederatedTenants    flagext.StringSliceCSV `yaml:"allowed_federated_tenants"`
 	DisallowedFederatedTenants flagext.StringSliceCSV `yaml:"disallowed_federated_tenants"`
 
+	// ReleaseBundles enables the optional immutable, generation-based rule
+	// release mechanism. Disabled by default, the default sync path is used.
+	ReleaseBundles ReleaseBundleConfig `yaml:"release_bundles"`
+
 	RingCheckPeriod time.Duration `yaml:"-"`
 
 	// Field will be populated during runtime.
@@ -235,6 +239,10 @@ func (cfg *Config) Validate(limits validation.Limits, log log.Logger) error {
 
 	if err := cfg.ThanosEngine.Validate(); err != nil {
 		return err
+	}
+
+	if err := cfg.ReleaseBundles.Validate(); err != nil {
+		return errors.Wrap(err, "invalid ruler release bundles config")
 	}
 
 	return nil
@@ -304,6 +312,8 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.EnableHAEvaluation, "ruler.enable-ha-evaluation", false, "Enable high availability")
 	f.DurationVar(&cfg.LivenessCheckTimeout, "ruler.liveness-check-timeout", 1*time.Second, "Timeout duration for non-primary rulers during liveness checks. If the check times out, the non-primary ruler will evaluate the rule group. Applicable when ruler.enable-ha-evaluation is true.")
 	cfg.RingCheckPeriod = 5 * time.Second
+
+	cfg.ReleaseBundles.RegisterFlags(f)
 }
 
 func (cfg *Config) RulesBackupEnabled() bool {
@@ -516,6 +526,16 @@ func (r *Ruler) starting(ctx context.Context) error {
 
 		if err = services.StartManagerAndAwaitHealthy(ctx, r.subservices); err != nil {
 			return errors.Wrap(err, "unable to start ruler subservices")
+		}
+	}
+
+	// Converge any sealed release bundle generations left by a crash and
+	// start the managers the active pointers resolve to.
+	if r.cfg.ReleaseBundles.Enabled {
+		if rb, ok := r.manager.(ReleaseBundleManager); ok {
+			if err := rb.RecoverReleaseBundles(ctx); err != nil {
+				level.Warn(r.logger).Log("msg", "failed to recover ruler release bundles", "err", err)
+			}
 		}
 	}
 
@@ -1693,6 +1713,45 @@ func (r *Ruler) AssertMaxRulesPerRuleGroup(userID string, rules int) error {
 		return nil
 	}
 	return fmt.Errorf(errMaxRulesPerRuleGroupPerUserLimitExceeded, limit, rules)
+}
+
+// PrepareReleaseBundle validates and seals an immutable rule generation for a
+// single tenant without touching the live manager. Returns the explicit
+// generation id needed by CommitReleaseBundle.
+func (r *Ruler) PrepareReleaseBundle(ctx context.Context, tenant string, groups rulespb.RuleGroupList) (string, *BundleManifest, error) {
+	rb, ok := r.manager.(ReleaseBundleManager)
+	if !ok {
+		return "", nil, errReleaseBundlesDisabled
+	}
+	return rb.PrepareReleaseBundle(ctx, tenant, groups)
+}
+
+// CommitReleaseBundle publishes the sealed generation and switches the live
+// manager to it under the recoverable bundle protocol.
+func (r *Ruler) CommitReleaseBundle(ctx context.Context, tenant, generation string) (*SwitchReport, error) {
+	rb, ok := r.manager.(ReleaseBundleManager)
+	if !ok {
+		return nil, errReleaseBundlesDisabled
+	}
+	return rb.CommitReleaseBundle(ctx, tenant, generation)
+}
+
+// CancelReleaseBundle reclaims an unpublished candidate generation.
+func (r *Ruler) CancelReleaseBundle(tenant, generation string) error {
+	rb, ok := r.manager.(ReleaseBundleManager)
+	if !ok {
+		return errReleaseBundlesDisabled
+	}
+	return rb.CancelReleaseBundle(tenant, generation)
+}
+
+// ActiveReleaseBundle returns the generation currently active for the tenant.
+func (r *Ruler) ActiveReleaseBundle(tenant string) (string, *BundleManifest, bool) {
+	rb, ok := r.manager.(ReleaseBundleManager)
+	if !ok {
+		return "", nil, false
+	}
+	return rb.ActiveReleaseBundle(tenant)
 }
 
 func (r *Ruler) DeleteTenantConfiguration(w http.ResponseWriter, req *http.Request) {

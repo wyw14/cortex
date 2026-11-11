@@ -84,6 +84,10 @@ type DefaultMultiTenantManager struct {
 	// and then by the prometheus rule group key.
 	federatedGroupsMtx sync.RWMutex
 	federatedGroups    map[string]map[string]string
+
+	// bundles is non-nil only when the optional release bundle mechanism is
+	// enabled. Tenants it owns are skipped by the default SyncRuleGroups path.
+	bundles *releaseBundleCoordinator
 }
 
 func NewDefaultMultiTenantManager(cfg Config, limits RulesLimits, managerFactory ManagerFactory, evalMetrics *RuleEvalMetrics, reg prometheus.Registerer, logger log.Logger) (*DefaultMultiTenantManager, error) {
@@ -157,6 +161,9 @@ func NewDefaultMultiTenantManager(cfg Config, limits RulesLimits, managerFactory
 	if cfg.RulesBackupEnabled() {
 		m.rulesBackupManager = newRulesBackupManager(cfg, logger, reg)
 	}
+	if cfg.ReleaseBundles.Enabled {
+		m.bundles = newReleaseBundleCoordinator(cfg, limits, m, reg, logger, nil)
+	}
 	return m, nil
 }
 
@@ -174,8 +181,29 @@ func (r *DefaultMultiTenantManager) SyncRuleGroups(ctx context.Context, ruleGrou
 	r.syncRuleMtx.Lock()
 	defer r.syncRuleMtx.Unlock()
 
+	// Tenants owned by the release bundle mechanism switch generations through
+	// the explicit prepare/commit API; the default sync path must not race
+	// with their sealed generations.
+	var managed map[string]struct{}
+	if r.bundles != nil {
+		managed = r.bundles.managedTenants()
+	}
+
 	for userID, ruleGroup := range ruleGroups {
+		if _, skip := managed[userID]; skip {
+			continue
+		}
 		r.syncRulesToManager(ctx, userID, ruleGroup)
+	}
+
+	// A bundle-managed tenant that disappeared from the rule store is torn down
+	// through the coordinator so its sealed generations are reclaimed as well.
+	if r.bundles != nil {
+		for userID := range managed {
+			if _, exists := ruleGroups[userID]; !exists {
+				r.bundles.removeTenant(ctx, userID)
+			}
+		}
 	}
 
 	r.userManagerMtx.Lock()
@@ -183,6 +211,9 @@ func (r *DefaultMultiTenantManager) SyncRuleGroups(ctx context.Context, ruleGrou
 
 	// Check for deleted users and remove them
 	for userID, mngr := range r.userManagers {
+		if _, skip := managed[userID]; skip {
+			continue
+		}
 		if _, exists := ruleGroups[userID]; !exists {
 			go mngr.Stop()
 			delete(r.userManagers, userID)
@@ -205,6 +236,71 @@ func (r *DefaultMultiTenantManager) SyncRuleGroups(ctx context.Context, ruleGrou
 	}
 
 	r.managersTotal.Set(float64(len(r.userManagers)))
+}
+
+// cleanupBundleTenant removes the per-user manager side state of a tenant
+// owned by the release bundle mechanism after its generation manager has
+// already been stopped by the coordinator.
+func (r *DefaultMultiTenantManager) cleanupBundleTenant(userID string) {
+	r.userManagerMtx.Lock()
+	delete(r.userManagers, userID)
+	r.userManagerMtx.Unlock()
+
+	r.removeNotifier(userID)
+	r.mapper.cleanupUser(userID)
+	r.setFederatedGroups(userID, nil)
+	r.userExternalLabels.remove(userID)
+	r.userExternalURL.remove(userID)
+	r.lastReloadSuccessful.DeleteLabelValues(userID)
+	r.lastReloadSuccessfulTimestamp.DeleteLabelValues(userID)
+	r.configUpdatesTotal.DeleteLabelValues(userID)
+	r.notificationRetriesTotal.DeleteLabelValues(userID)
+	r.userManagerMetrics.RemoveUserRegistry(userID)
+	if r.ruleEvalMetrics != nil {
+		r.ruleEvalMetrics.deletePerUserMetrics(userID)
+	}
+	r.deleteRuleCache(userID)
+}
+
+// PrepareReleaseBundle implements ReleaseBundleManager. When the optional
+// mechanism is disabled the default sync entry point remains the only path.
+func (r *DefaultMultiTenantManager) PrepareReleaseBundle(ctx context.Context, tenant string, groups rulespb.RuleGroupList) (string, *BundleManifest, error) {
+	if r.bundles == nil {
+		return "", nil, errReleaseBundlesDisabled
+	}
+	return r.bundles.PrepareReleaseBundle(ctx, tenant, groups)
+}
+
+// CommitReleaseBundle implements ReleaseBundleManager.
+func (r *DefaultMultiTenantManager) CommitReleaseBundle(ctx context.Context, tenant, generation string) (*SwitchReport, error) {
+	if r.bundles == nil {
+		return nil, errReleaseBundlesDisabled
+	}
+	return r.bundles.CommitReleaseBundle(ctx, tenant, generation)
+}
+
+// CancelReleaseBundle implements ReleaseBundleManager.
+func (r *DefaultMultiTenantManager) CancelReleaseBundle(tenant, generation string) error {
+	if r.bundles == nil {
+		return errReleaseBundlesDisabled
+	}
+	return r.bundles.CancelReleaseBundle(tenant, generation)
+}
+
+// ActiveReleaseBundle implements ReleaseBundleManager.
+func (r *DefaultMultiTenantManager) ActiveReleaseBundle(tenant string) (string, *BundleManifest, bool) {
+	if r.bundles == nil {
+		return "", nil, false
+	}
+	return r.bundles.ActiveReleaseBundle(tenant)
+}
+
+// RecoverReleaseBundles implements ReleaseBundleManager.
+func (r *DefaultMultiTenantManager) RecoverReleaseBundles(ctx context.Context) error {
+	if r.bundles == nil {
+		return errReleaseBundlesDisabled
+	}
+	return r.bundles.RecoverReleaseBundles(ctx)
 }
 
 func (r *DefaultMultiTenantManager) updateRuleCache(user string, rules []*promRules.Group) {
@@ -401,7 +497,7 @@ func (r *DefaultMultiTenantManager) newManager(ctx context.Context, userID strin
 	reg := prometheus.NewRegistry()
 	r.userManagerMetrics.AddUserRegistry(userID, reg)
 
-	notifier, err := r.getOrCreateNotifier(userID, reg)
+	notifier, err := r.getOrReuseNotifier(userID, reg)
 	if err != nil {
 		return nil, err
 	}
@@ -409,32 +505,28 @@ func (r *DefaultMultiTenantManager) newManager(ctx context.Context, userID strin
 	return r.managerFactory(ctx, userID, notifier, r.logger, r.frontendPool, reg)
 }
 
-func (r *DefaultMultiTenantManager) removeNotifier(userID string) {
+// getOrReuseNotifier returns the per-tenant notifier, creating and starting
+// it on first use. Release bundle generation switches create a new rules
+// manager for the same tenant and reuse its notifier, so unlike
+// getOrCreateNotifier this method never starts an already running discovery
+// manager twice (that would close its sync channel a second time).
+func (r *DefaultMultiTenantManager) getOrReuseNotifier(userID string, userManagerRegistry prometheus.Registerer) (*notifier.Manager, error) {
 	r.notifiersMtx.Lock()
 	defer r.notifiersMtx.Unlock()
 
 	if n, ok := r.notifiers[userID]; ok {
-		n.stop()
-	}
-
-	delete(r.notifiers, userID)
-}
-
-func (r *DefaultMultiTenantManager) getOrCreateNotifier(userID string, userManagerRegistry prometheus.Registerer) (*notifier.Manager, error) {
-	r.notifiersMtx.Lock()
-	defer r.notifiersMtx.Unlock()
-
-	n, ok := r.notifiers[userID]
-	if ok {
-		// When there is a stale user, we stop the notifier but do not remove it
-		n.run()
 		return n.notifier, nil
 	}
+	return r.createNotifierLocked(userID, userManagerRegistry)
+}
 
+// createNotifierLocked builds and starts a notifier for the user. The
+// notifiers lock must be held by the caller.
+func (r *DefaultMultiTenantManager) createNotifierLocked(userID string, userManagerRegistry prometheus.Registerer) (*notifier.Manager, error) {
 	logger := log.With(r.logger, "user", userID)
 	notificationRetries := r.notificationRetriesTotal.WithLabelValues(userID)
 
-	n = newRulerNotifier(&notifier.Options{
+	n := newRulerNotifier(&notifier.Options{
 		QueueCapacity: r.cfg.NotificationQueueCapacity,
 		Registerer:    userManagerRegistry,
 		Do: func(ctx context.Context, client *http.Client, req *http.Request) (*http.Response, error) {
@@ -463,6 +555,31 @@ func (r *DefaultMultiTenantManager) getOrCreateNotifier(userID string, userManag
 
 	r.notifiers[userID] = n
 	return n.notifier, nil
+}
+
+func (r *DefaultMultiTenantManager) removeNotifier(userID string) {
+	r.notifiersMtx.Lock()
+	defer r.notifiersMtx.Unlock()
+
+	if n, ok := r.notifiers[userID]; ok {
+		n.stop()
+	}
+
+	delete(r.notifiers, userID)
+}
+
+func (r *DefaultMultiTenantManager) getOrCreateNotifier(userID string, userManagerRegistry prometheus.Registerer) (*notifier.Manager, error) {
+	r.notifiersMtx.Lock()
+	defer r.notifiersMtx.Unlock()
+
+	n, ok := r.notifiers[userID]
+	if ok {
+		// When there is a stale user, we stop the notifier but do not remove it
+		n.run()
+		return n.notifier, nil
+	}
+
+	return r.createNotifierLocked(userID, userManagerRegistry)
 }
 
 // sendNotification sends the alerts of a tenant to one Alertmanager, retrying
